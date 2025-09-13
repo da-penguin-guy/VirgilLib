@@ -1,0 +1,12 @@
+# Ignore build artifacts and OS files
+*.obj
+*.o
+*.exe
+*.out
+*.log
+*.tmp
+*.user
+*.DS_Store
+*.vcxproj*
+*.sln
+build/
