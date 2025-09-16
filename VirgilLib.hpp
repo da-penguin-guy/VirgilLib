@@ -40,6 +40,7 @@ class ChannelLink;
  * - endResponse: Indicate end of response sequence
  * 
  * @note This class should be used as an interface - all derived classes must implement to_json()
+ * @note The field `isOutbound` is not represented in the message, it is to help with internal logic
  * @see Virgil Protocol 2.3.0 specification for complete message format details
  */
 class Message {
@@ -56,17 +57,16 @@ class Message {
          * Automatically parses the "messageType" field in the JSON and constructs the
          * corresponding Message subclass instance. This is the primary method for
          * deserializing incoming Virgil protocol messages.
-         * 
-         * Supported message types:
-         * - "channelLink" -> ChannelLink instance
-         * - "channelUnlink" -> ChannelUnlink instance
+         *
          * 
          * @param j The JSON object containing the message data. Must include "messageType" field.
          * @param outbound True if the message is outbound (being sent), false if inbound (received).
          * @return A pointer to a newly allocated Message subclass instance. 
          * @throws std::invalid_argument if messageType is missing or unknown
+         * @throws If constructor for the detected messageType fails
          * @note Caller is responsible for deleting the returned pointer
          * @note Additional message types will be added as they are implemented
+         * @note This is meant to be called on a single message found in the Messages array in a virgil message
          * 
          * @example
          * ```cpp
@@ -138,11 +138,11 @@ public:
      * - "messageID": 12-digit Virgil message ID
      * - "sendingChannelIndex": index of the sending channel
      * - "sendingChannelType": type of sending channel (0=tx, 1=rx, 2=aux)
+     * - "channelIndex": receiving channel index (omitted for aux channels)
+     * - "channelType": receiving channel type (omitted for aux channels)
      * 
      * Optional JSON fields:
      * - "responseID": ID of message this responds to
-     * - "channelIndex": receiving channel index (omitted for aux channels)
-     * - "channelType": receiving channel type (omitted for aux channels)
      * 
      * @param j The JSON object to initialize from. Must be valid Virgil channelLink message.
      * @param outbound True if the message is outbound (being sent), false if inbound (received).
@@ -175,19 +175,21 @@ public:
 
         // NOTE: sendingChannel and receivingChannel will not be flipped based on outbound status.
         // This is because the message is from the perspective of the sender, and this class just represents the message as-is.
-        // The semantics are: sendingChannel is transmitting data TO the receivingChannel
 
         // Reads sending channel information with custom field names as per Virgil protocol specification
         // Uses "sendingChannelIndex" and "sendingChannelType" to distinguish from receiving channel fields
         sendingChannel = ChannelID(j, "sendingChannelIndex", "sendingChannelType");
         
         // Reads receiving channel information with standard field names ("channelIndex", "channelType")
-        // For AUX channels, receiving channel may be omitted as they link to devices rather than channels
+        // For AUX channels, receiving channel must be omitted as they link to devices rather than channels
         if(j.contains("channelIndex") || j.contains("channelType"))
             receivingChannel = ChannelID(j);
         else
             receivingChannel = std::nullopt; // AUX channels can omit receiving channel
     }
+
+    /// TODO: recvChan should not be optional. SendingChannel should instead be optional for aux channels. 
+    /// This also applies to channelUnlinks
 
     /**
      * @brief Construct a ChannelLink programmatically with specified parameters.
@@ -282,6 +284,7 @@ public:
  * - Updates the linkedChannels parameter on both affected devices
  * - Can be initiated by either device in the link
  * - For AUX channels, unlinks from the associated device
+ * - Automatically unsubscribes
  * 
  * The message structure mirrors channelLink but indicates the removal of the relationship
  * rather than establishment.
@@ -344,9 +347,9 @@ public:
         responseID = *respId;
     }
 
-    // Converts the ChannelUnlink to a JSON object for sending.
-    // @return A JSON object representing the ChannelUnlink message.
-    // @throws std::invalid_argument if the receivingChannel is missing when sendingChannel is not aux.
+    /// Converts the ChannelUnlink to a JSON object for sending.
+    /// @return A JSON object representing the ChannelUnlink message.
+    /// @throws std::invalid_argument if the receivingChannel is missing when sendingChannel is not aux.
     nlohmann::json to_json() const override {
         nlohmann::json j;
         j["messageType"] = "channelUnlink";
@@ -648,7 +651,7 @@ public:
  * - Read-only status
  * - Enum values (for enum parameters)
  * 
- * The gain parameter is mandatory for all channels involving a preamp.
+ * The gain parameter is mandatory for all channels involving a preamp, even when the gain is fixed.
  * The linkedChannels parameter is mandatory and starts empty, being populated
  * as channels are linked/unlinked.
  * 
@@ -807,6 +810,7 @@ class InfoResponse : public Message {
  * 
  * @see Virgil Protocol 2.3.0 - "Parameters" section for complete specification
  * @note Non-readonly numeric parameters must specify minValue, maxValue, and precision
+ * @note The list of parameters seen above is not checked anywhere. That is just what is specified in the current Virgil version. Aux channels are allowed to make things up.
  */
 struct Parameter {
     std::string name; // Parameter name
@@ -1087,10 +1091,6 @@ struct Parameter {
  * This is commonly used for device settings that have discrete options rather than
  * continuous numeric ranges.
  * 
- * Common enum parameter examples in Virgil Protocol:
- * - transmitPower: ["low", "medium", "high"] for IEM systems
- * - subDevice: ["handheld", "beltpack", "gooseneck", "iem", "xlr", "trs", "disconnected", "other"]
- * - Custom device-specific settings with predefined options
  * 
  * The enum maintains both the current value and the complete list of valid values,
  * enabling proper validation and UI generation (dropdown menus, radio buttons, etc.).
@@ -1168,8 +1168,8 @@ struct VirgilEnum {
  * - Status monitoring: Subscribe to parameter changes on specific channels
  * 
  * Linking Rules:
- * - TX ↔ RX: Bidirectional linking for audio flow (either side can initiate)
- * - AUX → Device: AUX channels link to devices, not other channels
+ * - TX <-> RX: Bidirectional linking for audio flow (either side can initiate)
+ * - AUX -> Device: AUX channels link to devices, not other channels. The device with the aux channel cannot initiate.
  * - Channel indices start at 0 and must correspond to actual device capabilities
  * 
  * JSON Serialization:
@@ -1323,6 +1323,26 @@ enum class LinkType : uint8_t {
     rx = 1,   ///< Receive channels - Dante receiving channels that receive audio data  
     aux = 2   ///< Auxiliary channels - Non-Dante accessory channels (e.g., in-wall dials)
 };
+
+// Currently Unused, being implimented
+enum class VirgilError : uint8_t {
+    UnrecognizedCommand = 0
+    ValueOutOfRange = 1
+    InvalidValueType = 2
+    UnableToChangeValue = 3
+    DeviceNotFound = 4
+    ChannelIndexInvalid = 5
+    ParameterReadOnly = 6
+    ParameterUnsupported = 7
+    MalformedMessage = 8
+    Busy = 9
+    Timeout = 10
+    PermissionDenied = 11
+    InternalError = 12
+    OutOfResources = 13
+    NetworkError = 14
+    Custom = 255
+}
 
 /**
  * @brief A struct representing linked channel information for the mandatory linkedChannels parameter.
